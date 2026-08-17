@@ -61,8 +61,6 @@ const axiom = createAxiom({
 });
 const FREECLAUDE = path.join(DATA_DIR, "freeclaude.bat");
 const PUBLIC = path.join(__dirname, "public");
-const NODE_DIR_DEFAULT = "C:\\Program Files\\nodejs";
-const NPM_BIN = path.join(process.env.APPDATA || "", "npm");
 const LOCALAPPDATA = process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local");
 const NODE_PORTABLE_DIR = path.join(LOCALAPPDATA, "Programs", "node");
 const MIN_NODE_MAJOR = 22;
@@ -79,8 +77,12 @@ const MODEL_RE = /^[A-Za-z0-9._/:-]{1,120}$/;
 const TOKEN_RE = /^[A-Za-z0-9._-]{1,200}$/;
 // Local drive path or UNC share, without the characters cmd.exe treats as syntax.
 const PATH_RE = /^(?:[A-Za-z]:\\|\\\\)[^"|&<>^%\r\n]{0,400}$/;
+// POSIX path for macOS/Linux: starts with /, no dangerous shell chars
+const POSIX_PATH_RE = /^\/[^"'&|;<>\x60$\r\n]{0,400}$/;
 
 const {
+  NODE_DIR_DEFAULT,
+  NPM_BIN,
   configuredPaths,
   enrichedPath,
   existingFile,
@@ -100,23 +102,47 @@ const { toBatPath, toBatPathSafe } = require("./bat-path");
  * not installed with no way to correct it — hence the manual override per component.
  */
 function npmBinDir() {
-  const override = manualPath("omniroute", "omniroute.cmd") || manualPath("claude", "claude.cmd");
-  return override ? path.dirname(override) : NPM_BIN;
+  const isWin = process.platform === "win32";
+  const exe = isWin ? "npm.cmd" : "npm";
+  const omniExe = isWin ? "omniroute.cmd" : "omniroute";
+  const claudeExe = isWin ? "claude.cmd" : "claude";
+
+  const override = manualPath("omniroute", omniExe) || manualPath("claude", claudeExe) || manualPath("npm", exe);
+  if (override) return path.dirname(override);
+  const resolved = resolveNpm();
+  if (resolved) return path.dirname(resolved);
+  return NPM_BIN;
 }
 
 function omniCmdPath() {
+  if (process.platform !== "win32") {
+    // macOS / Linux: check homebrew and system paths
+    for (const p of ["/opt/homebrew/bin/omniroute", "/usr/local/bin/omniroute"]) {
+      if (fs.existsSync(p)) return p;
+    }
+    const wh = require("child_process").spawnSync("which", ["omniroute"], { encoding: "utf8" });
+    if (wh.stdout && wh.stdout.trim()) return wh.stdout.trim();
+  }
   return manualPath("omniroute", "omniroute.cmd") || path.join(npmBinDir(), "omniroute.cmd");
 }
 
 function claudeCmdPath() {
+  if (process.platform !== "win32") {
+    for (const p of ["/opt/homebrew/bin/claude", "/usr/local/bin/claude"]) {
+      if (fs.existsSync(p)) return p;
+    }
+    const wh = require("child_process").spawnSync("which", ["claude"], { encoding: "utf8" });
+    if (wh.stdout && wh.stdout.trim()) return wh.stdout.trim();
+  }
   return manualPath("claude", "claude.cmd") || path.join(npmBinDir(), "claude.cmd");
 }
 
+const IS_WIN = process.platform === "win32";
 const PATH_KEYS = {
-  node: { exe: "node.exe", label: "Node.js" },
-  npm: { exe: "npm.cmd", label: "npm" },
-  omniroute: { exe: "omniroute.cmd", label: "OmniRoute" },
-  claude: { exe: "claude.cmd", label: "Claude Code" },
+  node: { exe: IS_WIN ? "node.exe" : "node", label: "Node.js" },
+  npm: { exe: IS_WIN ? "npm.cmd" : "npm", label: "npm" },
+  omniroute: { exe: IS_WIN ? "omniroute.cmd" : "omniroute", label: "OmniRoute" },
+  claude: { exe: IS_WIN ? "claude.cmd" : "claude", label: "Claude Code" },
 };
 
 // Packaged EXE: do not auto-spawn a browser from inside pkg (causes 0xC0000005).
@@ -780,31 +806,37 @@ function openUrlApp(url) {
     }
   }
   try {
-    const child = spawn(
-      process.env.ComSpec || "cmd.exe",
-      ["/c", "start", "", url],
-      { detached: true, stdio: "ignore", windowsHide: true }
-    );
-    child.on("error", () => {});
-    child.unref();
+    if (process.platform === "darwin") {
+      const child = spawn("open", [url], { detached: true, stdio: "ignore" });
+      child.on("error", () => {});
+      child.unref();
+    } else {
+      const child = spawn(
+        process.env.ComSpec || "cmd.exe",
+        ["/c", "start", "", url],
+        { detached: true, stdio: "ignore", windowsHide: true }
+      );
+      child.on("error", () => {});
+      child.unref();
+    }
   } catch (err) {
     console.error("openUrlApp failed:", err && err.message ? err.message : err);
   }
   return true;
 }
 
-/** Fresh AWS session: ephemeral Chrome/Edge profile so Builder ID cookies are not reused. */
-function openAwsAuthWindow(deviceUrl, { fresh = true } = {}) {
-  const browser = findBrowser();
+/** AWS session: opens in active browser. */
+function openAwsAuthWindow(deviceUrl, { fresh = false } = {}) {
   const target = deviceUrl || AWS_PORTAL_URL;
+  if (!fresh || process.platform === "darwin") {
+    openUrlApp(target);
+    return { ok: true, mode: "browser", url: target };
+  }
+
+  const browser = findBrowser();
   if (!browser) {
     openUrlApp(target);
     return { ok: true, mode: "shell", url: target };
-  }
-
-  if (!fresh) {
-    openUrlApp(target);
-    return { ok: true, mode: "app", url: target };
   }
 
   const profileDir = path.join(os.tmpdir(), `freeclaude-aws-${Date.now()}`);
@@ -918,6 +950,15 @@ function whichExists(file) {
 }
 
 function omniModuleEntry() {
+  // macOS global install location (homebrew)
+  if (process.platform !== "win32") {
+    for (const p of [
+      "/opt/homebrew/lib/node_modules/omniroute/bin/omniroute.mjs",
+      "/usr/local/lib/node_modules/omniroute/bin/omniroute.mjs",
+    ]) {
+      if (fs.existsSync(p)) return p;
+    }
+  }
   return path.join(npmBinDir(), "node_modules", "omniroute", "bin", "omniroute.mjs");
 }
 
@@ -926,17 +967,33 @@ function isOmniRouteInstalled() {
 }
 
 function claudeNativeBin() {
+  if (process.platform !== "win32") {
+    // macOS: claude is an ELF/Mach-O binary, not a PE
+    return claudeCmdPath();
+  }
   return path.join(npmBinDir(), "node_modules", "@anthropic-ai", "claude-code", "bin", "claude.exe");
 }
 
 /** Real Claude Code binary — not the 500-byte postinstall stub. */
 function isClaudeCodeReady() {
   const cmd = claudeCmdPath();
+  if (!whichExists(cmd)) return false;
+
+  // On macOS/Linux: if the binary exists and is executable, it's ready
+  if (process.platform !== "win32") {
+    try {
+      const st = fs.statSync(cmd);
+      return st.isFile() && st.size > 1000;
+    } catch {
+      return false;
+    }
+  }
+
+  // On Windows: check for the real PE binary (not the tiny stub)
   const bin = claudeNativeBin();
-  if (!whichExists(cmd) || !whichExists(bin)) return false;
+  if (!whichExists(bin)) return false;
   try {
     const st = fs.statSync(bin);
-    // Stub is a tiny echo script; real win32 PE is multi‑MB.
     if (st.size < 100_000) return false;
     const fd = fs.openSync(bin, "r");
     const buf = Buffer.alloc(2);
@@ -947,6 +1004,7 @@ function isClaudeCodeReady() {
     return false;
   }
 }
+
 
 function readConfig() {
   try {
@@ -1301,6 +1359,7 @@ function killOrphanOmniRoute() {
 
 function spawnOmniRouteWatcher() {
   if (process.env.FREECLAUDE_NO_WATCHDOG === "1") return;
+  if (process.platform !== "win32") return; // powershell watcher is Windows-only
   const parentPid = process.pid;
   const scriptPath = path.join(os.tmpdir(), `freeclaude-omni-watcher-${parentPid}.ps1`);
   const script = `
@@ -1427,10 +1486,12 @@ function startOmniRoute(opts = {}) {
     if (nodeBin && whichExists(mjs)) {
       child = spawn(nodeBin, [mjs, "serve", "--no-open"], {
         ...spawnOpts,
-        cwd: path.join(npmBinDir(), "node_modules", "omniroute"),
+        cwd: process.platform === "win32" ? path.join(npmBinDir(), "node_modules", "omniroute") : path.dirname(path.dirname(mjs)),
       });
-    } else {
+    } else if (process.platform === "win32") {
       child = spawn(process.env.ComSpec || "cmd.exe", ["/d", "/c", omniCmd, "serve", "--no-open"], spawnOpts);
+    } else {
+      child = spawn(omniCmd, ["serve", "--no-open"], spawnOpts);
     }
     omniChild = child;
     omniOwned = true;
@@ -1604,7 +1665,8 @@ function assertSafeToken(token) {
  */
 function assertSafePath(value, label) {
   const p = String(value || "").trim();
-  if (!PATH_RE.test(p)) throw new Error(st("srv.badPath", { label: label ? ` (${label})` : "", path: p }));
+  const re = process.platform === "win32" ? PATH_RE : POSIX_PATH_RE;
+  if (!re.test(p)) throw new Error(st("srv.badPath", { label: label ? ` (${label})` : "", path: p }));
   return p;
 }
 
@@ -1625,6 +1687,9 @@ function writeCmdFile(file, body) {
   }
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, text, "utf8");
+  if (process.platform !== "win32") {
+    try { fs.chmodSync(file, 0o755); } catch { /* ignore */ }
+  }
 }
 
 /**
@@ -1702,7 +1767,45 @@ if not "%EC%"=="0" (
 )
 exit /b %EC%
 `;
-  writeCmdFile(FREECLAUDE, bat);
+
+  if (process.platform !== "win32") {
+    // macOS / Linux — write a proper bash script instead of .bat
+    const claudeBin = String(claudeCmdPath() || "").trim() || "claude";
+    const bashScript = `#!/usr/bin/env bash
+set -e
+
+export ANTHROPIC_BASE_URL="${OMNI}"
+export ANTHROPIC_AUTH_TOKEN="${token}"
+export ANTHROPIC_MODEL="${model}"
+export OMNIROUTE_API_KEY="${token}"
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+
+echo "Model: ${model}"
+echo "Starting Claude Code..."
+
+if ! curl -s -o /dev/null "${OMNI}/api/monitoring/health" 2>/dev/null; then
+  echo "[ERROR] OmniRoute offline. Open the FreeClaude panel first."
+  exit 1
+fi
+
+CLAUDE_BIN=""
+for c in "${claudeBin}" claude /opt/homebrew/bin/claude /usr/local/bin/claude; do
+  if [ -n "$c" ] && command -v "$c" &>/dev/null 2>&1; then
+    CLAUDE_BIN="$c"
+    break
+  fi
+done
+if [ -z "$CLAUDE_BIN" ]; then
+  echo "[ERROR] Claude Code not found. Install it from FreeClaude Settings."
+  exit 1
+fi
+
+exec "$CLAUDE_BIN" "$@"
+`;
+    writeCmdFile(FREECLAUDE, bashScript);
+  } else {
+    writeCmdFile(FREECLAUDE, bat);
+  }
 }
 
 function writeSettings(model, token) {
@@ -2462,10 +2565,33 @@ function mime(file) {
 }
 
 function findBrowser() {
+  if (process.platform === "darwin") {
+    const macCandidates = [
+      "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+      "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+      "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+      "/Applications/Chromium.app/Contents/MacOS/Chromium",
+      path.join(os.homedir(), "Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+    ];
+    return macCandidates.find((p) => fs.existsSync(p)) || null;
+  }
+  if (process.platform === "linux") {
+    const linuxCandidates = [
+      "/usr/bin/google-chrome",
+      "/usr/bin/google-chrome-stable",
+      "/usr/bin/chromium",
+      "/usr/bin/chromium-browser",
+      "/usr/bin/brave-browser",
+      "/usr/bin/microsoft-edge",
+    ];
+    return linuxCandidates.find((p) => fs.existsSync(p)) || null;
+  }
   const candidates = [
     path.join(process.env.ProgramFiles || "", "Google\\Chrome\\Application\\chrome.exe"),
     path.join(process.env.ProgramFiles || "", "Microsoft\\Edge\\Application\\msedge.exe"),
     path.join(process.env["ProgramFiles(x86)"] || "", "Microsoft\\Edge\\Application\\msedge.exe"),
+    path.join(process.env.LOCALAPPDATA || "", "Google\\Chrome\\Application\\chrome.exe"),
+    path.join(process.env.LOCALAPPDATA || "", "Programs\\BraveSoftware\\Brave-Browser\\Application\\brave.exe"),
   ];
   return candidates.find((p) => fs.existsSync(p)) || null;
 }
@@ -2478,6 +2604,10 @@ function shouldOpenBrowser() {
 function openWindow() {
   if (!shouldOpenBrowser()) return;
   const url = `http://127.0.0.1:${PORT}`;
+  if (process.platform === "darwin") {
+    spawn("open", [url], { detached: true, stdio: "ignore" }).unref();
+    return;
+  }
   const sys = process.env.SystemRoot || "C:\\Windows";
   const logPath = path.join(DATA_DIR, "open-ui.log");
   const log = (msg) => {
@@ -3195,7 +3325,6 @@ const server = http.createServer(async (req, res) => {
 
       let launchCwd = DATA_DIR;
       if (cwdRaw && path.isAbsolute(cwdRaw) && fs.existsSync(cwdRaw) && !/["|&<>^%\r\n]/.test(cwdRaw)) {
-        // spawn cwd accepts non-ASCII; do not force PATH_RE (that is for .bat bodies).
         launchCwd = cwdRaw;
       }
 
@@ -3209,12 +3338,51 @@ const server = http.createServer(async (req, res) => {
         title = `Claude Code - resume`;
       }
 
-      const launcher = path.join(DATA_DIR, "launch-claude.cmd");
-      const nodeBat = toBatPathSafe(nodeDir(), "%ProgramFiles%\\nodejs");
-      const npmBat = toBatPathSafe(npmBinDir(), "%APPDATA%\\npm");
-      writeCmdFile(
-        launcher,
-        `@echo off
+      if (process.platform !== "win32") {
+        const launcher = path.join(DATA_DIR, "launch-claude.sh");
+        writeCmdFile(
+          launcher,
+          `#!/usr/bin/env bash
+cd "${launchCwd}"
+export PATH="${nodeDir()}:${npmBinDir()}:$PATH"
+echo ""
+echo "  ${title}"
+echo "  Model: ${model}"
+echo "  Mode: ${mode}${mode === "resume" ? ` (${sessionId ? sessionId.slice(0, 8) : ""})` : ""}"
+echo "  Starting Claude Code..."
+echo ""
+if [ ! -f "${FREECLAUDE}" ]; then
+  echo "[ERROR] freeclaude.sh not found in ${DATA_DIR}"
+  echo "Open FreeClaude, connect a model, then try again."
+  exit 1
+fi
+exec "${FREECLAUDE}" ${claudeArgs} "$@"
+`
+        );
+        try { fs.chmodSync(launcher, 0o755); } catch { /* ignore */ }
+
+        if (process.platform === "darwin") {
+          spawn("open", ["-a", "Terminal", launcher], {
+            detached: true,
+            stdio: "ignore",
+            cwd: launchCwd,
+            env: { ...process.env, PATH: `${nodeDir()}:${npmBinDir()}:${enrichedPath()}` },
+          }).unref();
+        } else {
+          spawn("x-terminal-emulator", ["-e", launcher], {
+            detached: true,
+            stdio: "ignore",
+            cwd: launchCwd,
+            env: { ...process.env, PATH: `${nodeDir()}:${npmBinDir()}:${enrichedPath()}` },
+          }).unref();
+        }
+      } else {
+        const launcher = path.join(DATA_DIR, "launch-claude.cmd");
+        const nodeBat = toBatPathSafe(nodeDir(), "%ProgramFiles%\nodejs");
+        const npmBat = toBatPathSafe(npmBinDir(), "%APPDATA%\npm");
+        writeCmdFile(
+          launcher,
+          `@echo off
 setlocal EnableExtensions
 set "PATH=${nodeBat};${npmBat};%PATH%"
 title ${title}
@@ -3223,25 +3391,25 @@ echo  Model: ${model}
 echo  Mode: ${mode}${mode === "resume" ? ` (${sessionId.slice(0, 8)})` : ""}
 echo  Starting Claude Code...
 echo.
-if not exist "%APPDATA%\\FreeClaude\\freeclaude.bat" (
-  echo [ERROR] freeclaude.bat not found in %%APPDATA%%\\FreeClaude
+if not exist "%APPDATA%\FreeClaude\freeclaude.bat" (
+  echo [ERROR] freeclaude.bat not found in %%APPDATA%%\FreeClaude
   echo Open FreeClaude, connect a model, then try again.
   pause
   exit /b 1
 )
-call "%APPDATA%\\FreeClaude\\freeclaude.bat" ${claudeArgs}
+call "%APPDATA%\FreeClaude\freeclaude.bat" ${claudeArgs}
 if errorlevel 1 pause
 `
-      );
+        );
 
-      spawn("cmd.exe", ["/c", "start", title, "cmd.exe", "/k", launcher], {
-        detached: true,
-        stdio: "ignore",
-        windowsHide: false,
-        cwd: launchCwd,
-        env: { ...process.env, PATH: `${nodeDir()};${npmBinDir()};${enrichedPath()}` },
-      }).unref();
-
+        spawn("cmd.exe", ["/c", "start", title, "cmd.exe", "/k", launcher], {
+          detached: true,
+          stdio: "ignore",
+          windowsHide: false,
+          cwd: launchCwd,
+          env: { ...process.env, PATH: `${nodeDir()};${npmBinDir()};${enrichedPath()}` },
+        }).unref();
+      }
       appLog.info(`Claude launch mode=${mode} model=${model} cwd=${launchCwd}`);
       return send(res, 200, { ok: true, model, mode, sessionId: sessionId || null, cwd: launchCwd });
     }

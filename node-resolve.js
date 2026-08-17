@@ -3,7 +3,7 @@
  *
  * A packaged FreeClaude.exe still needs a real system Node to run sqlite-bridge.js,
  * because pkg cannot load native addons. Users install Node in a lot of places
- * (other drives, nvm, Scoop), so both server.js and omni-keys-proxy.js resolve it
+ * (other drives, nvm, Scoop, homebrew), so both server.js and omni-keys-proxy.js resolve it
  * through this module rather than assuming C:\Program Files\nodejs.
  */
 const fs = require("fs");
@@ -11,12 +11,19 @@ const os = require("os");
 const path = require("path");
 const { spawnSync } = require("child_process");
 
-const NODE_DIR_DEFAULT = "C:\\Program Files\\nodejs";
-const NPM_BIN = path.join(process.env.APPDATA || "", "npm");
-const APPDATA = process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming");
+const IS_WIN = process.platform === "win32";
+const NODE_DIR_DEFAULT = IS_WIN ? "C:\\Program Files\\nodejs" : "/opt/homebrew/bin";
+const NPM_BIN = IS_WIN
+  ? path.join(process.env.APPDATA || "", "npm")
+  : "/opt/homebrew/bin";
+const APPDATA = IS_WIN
+  ? process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming")
+  : path.join(os.homedir(), ".config");
 // Read straight from the config file rather than taking the paths as arguments: the
 // packaged exe and the sqlite bridge are separate processes and both must see the override.
-const CONFIG_FILE = path.join(APPDATA, "FreeClaude", "config.json");
+const CONFIG_FILE = IS_WIN
+  ? path.join(APPDATA, "FreeClaude", "config.json")
+  : path.join(os.homedir(), ".config", "FreeClaude", "config.json");
 
 let _nodePathCache;
 let _npmPathCache;
@@ -24,6 +31,7 @@ let _winPathCache = null;
 let _winPathCachedAt = 0;
 
 function readWindowsUserMachinePath() {
+  if (!IS_WIN) return "";
   if (_winPathCache && Date.now() - _winPathCachedAt < 60_000) return _winPathCache;
   try {
     const r = spawnSync(
@@ -46,6 +54,18 @@ function readWindowsUserMachinePath() {
 }
 
 function enrichedPath() {
+  if (!IS_WIN) {
+    return [
+      "/opt/homebrew/bin",
+      "/opt/homebrew/opt/node@22/bin",
+      "/opt/homebrew/opt/node/bin",
+      "/usr/local/bin",
+      "/usr/bin",
+      process.env.PATH || "",
+    ]
+      .filter(Boolean)
+      .join(":");
+  }
   return [
     NODE_DIR_DEFAULT,
     process.env.NVM_SYMLINK || "",
@@ -59,6 +79,19 @@ function enrichedPath() {
 }
 
 function whereOnPath(name) {
+  if (!IS_WIN) {
+    // On macOS/Linux use 'which'
+    try {
+      const r = spawnSync("which", [name], {
+        encoding: "utf8",
+        timeout: 5000,
+        env: { ...process.env, PATH: enrichedPath() },
+      });
+      const result = String(r.stdout || "").trim();
+      if (result && fs.existsSync(result)) return result;
+    } catch { /* ignore */ }
+    return null;
+  }
   try {
     const r = spawnSync("where.exe", [name], {
       encoding: "utf8",
@@ -119,6 +152,21 @@ function resolveNode() {
     _nodePathCache = undefined;
   }
 
+  if (!IS_WIN) {
+    _nodePathCache =
+      firstExisting([
+        manualPath("node", "node"),
+        "/opt/homebrew/opt/node@22/bin/node",
+        "/opt/homebrew/opt/node/bin/node",
+        "/opt/homebrew/bin/node",
+        "/usr/local/bin/node",
+        "/usr/bin/node",
+        whereOnPath("node"),
+        process.execPath && process.execPath.includes("node") ? process.execPath : null,
+      ]) || null;
+    return _nodePathCache;
+  }
+
   const driveCandidates = [];
   for (const letter of "CDEFGHIJKLMNOPQRSTUVWXYZ") {
     for (const base of [`${letter}:\\Program Files`, `${letter}:\\Program Files (x86)`]) {
@@ -150,7 +198,23 @@ function resolveNpm() {
     _npmPathCache = undefined;
   }
   const node = resolveNode();
-  // npm.cmd next to node.exe wins over %APPDATA%\npm shims, which can point at a stale install.
+
+  if (!IS_WIN) {
+    _npmPathCache =
+      firstExisting([
+        manualPath("npm", "npm"),
+        node ? path.join(path.dirname(node), "npm") : null,
+        "/opt/homebrew/opt/node@22/bin/npm",
+        "/opt/homebrew/opt/node/bin/npm",
+        "/opt/homebrew/bin/npm",
+        "/usr/local/bin/npm",
+        "/usr/bin/npm",
+        whereOnPath("npm"),
+      ]) || null;
+    return _npmPathCache;
+  }
+
+  // npm.cmd next to node.exe wins over %APPDATA%\npm shims
   _npmPathCache =
     firstExisting([
       manualPath("npm", "npm.cmd"),
@@ -179,12 +243,12 @@ function invalidateToolCache() {
   _winPathCachedAt = 0;
 }
 
-/** Major version of the given node.exe, or null when it cannot be determined. */
+/** Major version of the given node binary, or null when it cannot be determined. */
 function nodeMajorVersion(nodeExe) {
   try {
     const r = spawnSync(nodeExe, ["-p", "process.versions.node"], {
       encoding: "utf8",
-      windowsHide: true,
+      windowsHide: IS_WIN,
       timeout: 8000,
     });
     const m = /^(\d+)\./.exec(String(r.stdout || "").trim());

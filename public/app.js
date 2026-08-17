@@ -855,6 +855,11 @@ async function awsSignOut() {
   if (els.btnAwsSignOut) els.btnAwsSignOut.disabled = true;
   try {
     reportClientLog("info", "AWS sign-out clicked", "auth");
+    try {
+      window.open("https://view.awsapps.com/start/#/signout", "_blank");
+    } catch {
+      /* ignore */
+    }
     const r = await fetch("/api/kiro/aws-signout", { method: "POST" }).then((x) => x.json());
     if (!r.ok) {
       toast(r.error || t("kiro.awsSignOutFailed"), true);
@@ -925,7 +930,7 @@ async function openKiroAuth() {
       els.kiroModal.setAttribute("aria-hidden", "false");
     }
 
-    await openAwsWindow(kiroAuth.verificationUriComplete, { fresh: true });
+    await openAwsWindow(kiroAuth.verificationUriComplete, { signOutFirst: true });
     setKiroWait("wait");
 
     if (kiroAuth.timer) clearTimeout(kiroAuth.timer);
@@ -1091,24 +1096,46 @@ function setKiroWait(state, title, sub) {
   }
 }
 
-/** Open AWS device auth in a clean browser profile (no saved Builder ID session). */
-async function openAwsWindow(url, { fresh = true } = {}) {
+const AWS_SIGNOUT_URL = "https://view.awsapps.com/start/#/signout";
+
+/** Open AWS device auth in current browser tab, signing out first to clear old cookies. */
+async function openAwsWindow(url, { signOutFirst = true } = {}) {
   if (!url) return false;
+  try {
+    if (signOutFirst) {
+      // Step 1: Open signout to purge cookies in the active browser tab
+      const w = window.open(AWS_SIGNOUT_URL, "_blank");
+      if (w) {
+        kiroAuth.awsWin = w;
+        // Step 2: After allowing AWS to clear session tokens, redirect to device auth
+        setTimeout(() => {
+          try {
+            w.location.href = url;
+          } catch {
+            window.open(url, "_blank");
+          }
+        }, 1200);
+        return true;
+      }
+    } else {
+      const w = window.open(url, "_blank");
+      if (w) {
+        kiroAuth.awsWin = w;
+        return true;
+      }
+    }
+  } catch {
+    /* popup blocked, try server fallback */
+  }
   try {
     const r = await fetch("/api/kiro/open-aws", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url, fresh }),
+      body: JSON.stringify({ url, fresh: false }),
     }).then((x) => x.json());
     return Boolean(r.ok);
   } catch {
-    try {
-      const w = window.open(url, "kiro_aws_auth", "popup=yes,width=980,height=820");
-      kiroAuth.awsWin = w;
-      return Boolean(w);
-    } catch {
-      return false;
-    }
+    return false;
   }
 }
 
@@ -1991,7 +2018,7 @@ if (els.btnKiroCopy) els.btnKiroCopy.addEventListener("click", copyKiroCode);
 if (els.btnKiroOpenAws) {
   els.btnKiroOpenAws.addEventListener("click", async () => {
     if (!kiroAuth.verificationUriComplete) return;
-    const ok = await openAwsWindow(kiroAuth.verificationUriComplete, { fresh: true });
+    const ok = await openAwsWindow(kiroAuth.verificationUriComplete, { signOutFirst: true });
     if (!ok) {
       toast(t("kiro.awsOpenFailed"), true);
       return;

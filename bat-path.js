@@ -9,6 +9,8 @@ const os = require("os");
  * %USERPROFILE% at runtime avoids embedding those characters in the script at all.
  * Do not add a UTF-8 BOM to the .bat — cmd.exe then fails on `@echo off`.
  */
+const win32 = path.win32 || path;
+
 function batPathRoots(env = process.env) {
   return [
     [env.APPDATA, "%APPDATA%"],
@@ -28,11 +30,12 @@ function hasNonAscii(value) {
  * environment variables. Falls back to the absolute path when nothing matches.
  */
 function toBatPath(absPath, env = process.env) {
-  const abs = path.resolve(String(absPath || ""));
+  const raw = String(absPath || "");
+  const abs = win32.isAbsolute(raw) ? raw : win32.resolve(raw);
   const absLower = abs.toLowerCase();
 
   for (const [root, token] of batPathRoots(env)) {
-    const rootAbs = path.resolve(String(root));
+    const rootAbs = String(root);
     const rootLower = rootAbs.toLowerCase();
     if (absLower === rootLower) return token;
     const prefix = rootLower.endsWith("\\") ? rootLower : `${rootLower}\\`;
