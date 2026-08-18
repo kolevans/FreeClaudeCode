@@ -3,10 +3,16 @@
 const fs = require("fs");
 const path = require("path");
 
+const ALLOWED_FNS = new Set([
+  "createApiKey", "ensureApiKey", "listApiKeys", "getKiroStatus",
+  "getKeyUsage", "logoutKiro", "getAccountLimitInfo", "clearKiroCooldowns",
+  "healKiroConnections", "hasKiroCredentials", "diagnoseInstall", "repairInstall",
+]);
+
 try {
   const keys = require(path.join(__dirname, "omni-keys.js"));
   const fn = process.argv[2];
-  if (!fn || typeof keys[fn] !== "function") {
+  if (!fn || !ALLOWED_FNS.has(fn) || typeof keys[fn] !== "function") {
     process.stdout.write(JSON.stringify({ error: `Unknown fn: ${fn}` }));
     process.exit(2);
   }
